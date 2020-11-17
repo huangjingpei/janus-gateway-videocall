@@ -391,11 +391,18 @@ typedef struct janus_videocall_session {
 	volatile gint dataready;
 	volatile gint hangingup;
 	volatile gint destroyed;
+	volatile gint answered;
+	GSource* ringing_source;
 	janus_mutex mutex;
 	janus_refcount ref;
 } janus_videocall_session;
 static GHashTable *sessions = NULL, *usernames = NULL;
 static janus_mutex sessions_mutex = JANUS_MUTEX_INITIALIZER;
+static GMainContext *videocall_watchdog_context = NULL;
+static GMainLoop *videocall_watchdog_loop = NULL;
+static GThread *videocall_watchdog_thread = NULL;
+static gint ringing_duration = 30;
+
 
 static void janus_videocall_session_destroy(janus_videocall_session *session) {
 	if(session && g_atomic_int_compare_and_exchange(&session->destroyed, 0, 1))
@@ -456,6 +463,14 @@ static void janus_videocall_message_free(janus_videocall_message *msg) {
 #define JANUS_VIDEOCALL_ERROR_INVALID_SDP			483
 
 
+static gpointer janus_videocall_watchdog(gpointer user_data) {
+	GMainLoop *loop = (GMainLoop *) user_data;
+	JANUS_LOG(LOG_INFO, "videocall watchdog started\n");
+	g_main_loop_run(loop);
+	JANUS_LOG(LOG_INFO, "videocall watchdog stopped\n");
+	return NULL;
+}
+
 /* Plugin implementation */
 int janus_videocall_init(janus_callbacks *callback, const char *config_path) {
 	if(g_atomic_int_get(&stopping)) {
@@ -487,6 +502,12 @@ int janus_videocall_init(janus_callbacks *callback, const char *config_path) {
 		if(!notify_events && callback->events_is_enabled()) {
 			JANUS_LOG(LOG_WARN, "Notification of events to handlers disabled for %s\n", JANUS_VIDEOCALL_NAME);
 		}
+		
+		janus_config_item *duration = janus_config_get(config, config_general, janus_config_type_item, "ringing_duration");
+		if(duration != NULL && duration->value != NULL) {
+			ringing_duration = atol(duration->value);
+		}
+
 	}
 	janus_config_destroy(config);
 	config = NULL;
@@ -498,10 +519,27 @@ int janus_videocall_init(janus_callbacks *callback, const char *config_path) {
 	/* This is the callback we'll need to invoke to contact the Janus core */
 	gateway = callback;
 
+	videocall_watchdog_context = g_main_context_new();
+	videocall_watchdog_loop = g_main_loop_new(videocall_watchdog_context, FALSE);
+	GError *error = NULL;
+	videocall_watchdog_thread = g_thread_try_new("timeout watchdog", &janus_videocall_watchdog, videocall_watchdog_loop, &error);
+	if(error != NULL) {
+		JANUS_LOG(LOG_FATAL, "Got error %d (%s) trying to start videocall timeout watchdog...\n",
+				error->code, error->message ? error->message : "??");
+		g_error_free(error);
+		g_main_loop_quit(videocall_watchdog_loop);
+		g_thread_join(videocall_watchdog_thread);
+		videocall_watchdog_thread = NULL;
+		g_main_loop_unref(videocall_watchdog_loop);
+		g_main_context_unref(videocall_watchdog_context);
+		videocall_watchdog_context = NULL;
+		return -1;
+	}
+
 	g_atomic_int_set(&initialized, 1);
 
 	/* Launch the thread that will handle incoming messages */
-	GError *error = NULL;
+	//GError *error = NULL;
 	handler_thread = g_thread_try_new("videocall handler", janus_videocall_handler, NULL, &error);
 	if(error != NULL) {
 		g_atomic_int_set(&initialized, 0);
@@ -533,6 +571,13 @@ void janus_videocall_destroy(void) {
 	janus_mutex_unlock(&sessions_mutex);
 	g_async_queue_unref(messages);
 	messages = NULL;
+	JANUS_LOG(LOG_INFO, "Ending  videocall watchdog...\n");
+	g_main_loop_quit(videocall_watchdog_loop);
+	g_thread_join(videocall_watchdog_thread);
+	videocall_watchdog_thread = NULL;
+	g_main_loop_unref(videocall_watchdog_loop);
+	g_main_context_unref(videocall_watchdog_context);
+	videocall_watchdog_context = NULL;
 	g_atomic_int_set(&initialized, 0);
 	g_atomic_int_set(&stopping, 0);
 	JANUS_LOG(LOG_INFO, "%s destroyed!\n", JANUS_VIDEOCALL_NAME);
@@ -599,6 +644,7 @@ void janus_videocall_create_session(janus_plugin_session *handle, int *error) {
 	g_atomic_int_set(&session->incall, 0);
 	g_atomic_int_set(&session->hangingup, 0);
 	g_atomic_int_set(&session->destroyed, 0);
+	g_atomic_int_set(&session->answered, 0);
 	handle->plugin_handle = session;
 	janus_refcount_init(&session->ref, janus_videocall_session_free);
 
@@ -979,6 +1025,20 @@ void janus_videocall_hangup_media(janus_plugin_session *handle) {
 	janus_mutex_unlock(&sessions_mutex);
 }
 
+static gboolean janus_ringing_timeout_handle(gpointer user_data) {
+	janus_videocall_session *session = (janus_videocall_session*)user_data;
+	if (!g_atomic_int_get(&session->answered)) {
+		JANUS_LOG(LOG_ERR, "hanup the media\n");
+		janus_videocall_hangup_media(session->handle);
+	}
+	if(session->ringing_source) {
+		g_source_destroy(session->ringing_source);
+		g_source_unref(session->ringing_source);
+		session->ringing_source = NULL;
+	}
+	return G_SOURCE_REMOVE;
+}
+
 static void janus_videocall_hangup_media_internal(janus_plugin_session *handle) {
 	if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
 		return;
@@ -1047,6 +1107,7 @@ static void janus_videocall_hangup_media_internal(janus_plugin_session *handle) 
 	}
 	janus_rtp_switching_context_reset(&session->context);
 	g_atomic_int_set(&session->hangingup, 0);
+	g_atomic_int_set(&session->answered, 0);
 }
 
 /* Thread to handle incoming messages */
@@ -1309,6 +1370,7 @@ static void *janus_videocall_handler(void *data) {
 				if(session->e2ee)
 					json_object_set_new(jsep, "e2ee", json_true());
 				g_atomic_int_set(&session->hangingup, 0);
+				g_atomic_int_set(&session->answered, 0);
 				int ret = gateway->push_event(peer->handle, &janus_videocall_plugin, NULL, call, jsep);
 				JANUS_LOG(LOG_VERB, "  >> Pushing event to peer: %d (%s)\n", ret, janus_get_api_error(ret));
 				json_decref(call);
@@ -1322,6 +1384,18 @@ static void *janus_videocall_handler(void *data) {
 					json_object_set_new(info, "event", json_string("calling"));
 					gateway->notify_event(&janus_videocall_plugin, session->handle, info);
 				}
+
+				if (session->peer->ringing_source) {
+					g_source_destroy(session->peer->ringing_source);
+					g_source_unref(session->peer->ringing_source);
+					session->peer->ringing_source = NULL;
+				}
+
+				session->peer->ringing_source = g_timeout_source_new_seconds(ringing_duration);
+				g_source_set_callback(session->peer->ringing_source, janus_ringing_timeout_handle, session->peer, NULL);
+				g_source_set_priority(session->peer->ringing_source, G_PRIORITY_DEFAULT);
+				g_source_attach(session->peer->ringing_source, videocall_watchdog_context);
+				
 			}
 		} else if(!strcasecmp(request_text, "accept")) {
 			/* Accept a call from another peer */
@@ -1406,6 +1480,7 @@ static void *janus_videocall_handler(void *data) {
 			json_object_set_new(calling, "username", json_string(session->username));
 			json_object_set_new(call, "result", calling);
 			g_atomic_int_set(&session->hangingup, 0);
+			g_atomic_int_set(&session->answered, 1);
 			int ret = gateway->push_event(peer->handle, &janus_videocall_plugin, NULL, call, jsep);
 			JANUS_LOG(LOG_VERB, "  >> Pushing event to peer: %d (%s)\n", ret, janus_get_api_error(ret));
 			json_decref(call);
