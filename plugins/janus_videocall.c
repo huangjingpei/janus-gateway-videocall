@@ -1295,17 +1295,17 @@ static void *janus_videocall_handler(void *data) {
 				}
 				janus_mutex_unlock(&sessions_mutex);
 				JANUS_LOG(LOG_VERB, "%s is busy\n", username_text);
-				result = json_object();
-				json_object_set_new(result, "event", json_string("hangup"));
-				json_object_set_new(result, "username", json_string(session->username));
-				json_object_set_new(result, "reason", json_string("User busy"));
-				/* Also notify event handlers */
-				if(notify_events && gateway->events_is_enabled()) {
-					json_t *info = json_object();
-					json_object_set_new(info, "event", json_string("hangup"));
-					json_object_set_new(info, "reason", json_string("User busy"));
-					gateway->notify_event(&janus_videocall_plugin, session->handle, info);
-				}
+				/* Send SDP to our peer */
+				json_t *call = json_object();
+				json_object_set_new(call, "videocall", json_string("event"));
+				json_t *calling = json_object();
+				json_object_set_new(calling, "event", json_string("missingcall"));
+				json_object_set_new(calling, "username", json_string(session->username));
+				json_object_set_new(call, "result", calling);
+				int ret = gateway->push_event(peer->handle, &janus_videocall_plugin, NULL, call, NULL);
+				char *payload = json_dumps(message, JSON_INDENT(3) | JSON_PRESERVE_ORDER);
+				JANUS_LOG(LOG_VERB, "  >> Pushing event to peer: %d (%s)\n", ret, janus_get_api_error(ret));
+				json_decref(call);
 				/* Hangup the call attempt of the user */
 				gateway->close_pc(session->handle);
 			} else {
