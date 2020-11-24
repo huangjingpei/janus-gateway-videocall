@@ -325,6 +325,7 @@ static janus_ice_queued_packet
 	janus_ice_add_candidates,
 	janus_ice_dtls_handshake,
 	janus_ice_hangup_peerconnection,
+	janus_ice_destory_handle,
 	janus_ice_detach_handle,
 	janus_ice_data_ready;
 
@@ -1416,6 +1417,36 @@ void janus_ice_webrtc_hangup(janus_ice_handle *handle, const char *reason) {
 		g_main_context_wakeup(handle->mainctx);
 	}
 }
+
+
+void janus_ice_handle_destory(janus_ice_handle *handle, const char *reason) {
+	if(handle == NULL)
+		return;
+	g_atomic_int_set(&handle->closepc, 0);
+	if(janus_flags_is_set(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_ALERT))
+		return;
+	janus_flags_set(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_ALERT);
+	janus_flags_set(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_CLEANING);
+	janus_flags_clear(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_GOT_OFFER);
+	janus_flags_clear(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_GOT_ANSWER);
+	janus_flags_clear(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_NEGOTIATED);
+	janus_flags_clear(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_HAS_AUDIO);
+	janus_flags_clear(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_HAS_VIDEO);
+	/* User will be notified only after the actual hangup */
+	JANUS_LOG(LOG_VERB, "[%"SCNu64"] Hanging up PeerConnection because of a %s\n",
+		handle->handle_id, reason);
+	handle->hangup_reason = reason;
+	/* Let's message the loop, we'll notify the plugin from there */
+	if(handle->queued_packets != NULL) {
+#if GLIB_CHECK_VERSION(2, 46, 0)
+		g_async_queue_push_front(handle->queued_packets, &janus_ice_destory_handle);
+#else
+		g_async_queue_push(handle->queued_packets, &janus_ice_destory_handle);
+#endif
+		g_main_context_wakeup(handle->mainctx);
+	}
+}
+
 
 static void janus_ice_webrtc_free(janus_ice_handle *handle) {
 	if(handle == NULL)
@@ -4146,6 +4177,30 @@ static gboolean janus_ice_outgoing_traffic_handle(janus_ice_handle *handle, janu
 		if(plugin != NULL && handle->app_handle != NULL) {
 			plugin->hangup_media(handle->app_handle);
 		}
+		/* Get rid of the attached sources */
+		if(handle->rtcp_source) {
+			g_source_destroy(handle->rtcp_source);
+			g_source_unref(handle->rtcp_source);
+			handle->rtcp_source = NULL;
+		}
+		if(handle->twcc_source) {
+			g_source_destroy(handle->twcc_source);
+			g_source_unref(handle->twcc_source);
+			handle->twcc_source = NULL;
+		}
+		if(handle->stats_source) {
+			g_source_destroy(handle->stats_source);
+			g_source_unref(handle->stats_source);
+			handle->stats_source = NULL;
+		}
+		/* If event handlers are active, send stats one last time */
+		if(janus_events_is_enabled()) {
+			handle->last_event_stats = janus_ice_event_stats_period;
+			(void)janus_ice_outgoing_stats_handle(handle);
+		}
+		janus_ice_webrtc_free(handle);
+		return G_SOURCE_CONTINUE;
+	} else if (pkt == &janus_ice_destory_handle) {
 		/* Get rid of the attached sources */
 		if(handle->rtcp_source) {
 			g_source_destroy(handle->rtcp_source);

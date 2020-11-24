@@ -619,6 +619,8 @@ void janus_ice_stream_destroy(janus_ice_stream *stream);
 void janus_ice_component_destroy(janus_ice_component *component);
 ///@}
 
+void janus_ice_handle_destory(janus_ice_handle *handle, const char *reason);
+
 
 /** @name Janus ICE media relaying callbacks
  */
