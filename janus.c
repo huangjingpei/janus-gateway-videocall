@@ -3407,13 +3407,26 @@ int janus_plugin_push_event(janus_plugin_session *plugin_session, janus_plugin *
 		janus_refcount_decrease(&ice_handle->ref);
 		return JANUS_ERROR_SESSION_NOT_FOUND;
 	}
+	
 	/* Make sure this is a JSON object */
 	if(!json_is_object(message)) {
 		JANUS_LOG(LOG_ERR, "[%"SCNu64"] Cannot push event (JSON error: not an object)\n", ice_handle->handle_id);
 		janus_refcount_decrease(&plugin_session->ref);
 		janus_refcount_decrease(&ice_handle->ref);
 		return JANUS_ERROR_INVALID_JSON_OBJECT;
+	} else {
+		json_t *result = json_object_get(message, "result");
+		if (json_is_object(result)) {
+			const char *event =  json_string_value(json_object_get(result, "event"));
+			if ((event != NULL) && (strcmp(event, "stopringing") == 0)) {
+				janus_ice_handle_destory(ice_handle, "stopringing");
+				janus_refcount_decrease(&plugin_session->ref);
+				janus_refcount_decrease(&ice_handle->ref);
+				return JANUS_OK;
+			}
+		}
 	}
+
 	/* Attach JSEP if possible? */
 	const char *sdp_type = json_string_value(json_object_get(jsep, "type"));
 	const char *sdp = json_string_value(json_object_get(jsep, "sdp"));

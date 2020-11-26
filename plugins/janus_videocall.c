@@ -338,6 +338,9 @@ static struct janus_json_parameter request_parameters[] = {
 static struct janus_json_parameter username_parameters[] = {
 	{"username", JSON_STRING, JANUS_JSON_PARAM_REQUIRED}
 };
+static struct janus_json_parameter accept_race_parameters[] = {
+	{"accept_race", JANUS_JSON_BOOL, 0}
+};
 static struct janus_json_parameter set_parameters[] = {
 	{"audio", JANUS_JSON_BOOL, 0},
 	{"video", JANUS_JSON_BOOL, 0},
@@ -395,6 +398,8 @@ typedef struct janus_videocall_session {
 	GSource* ringing_source;
 	janus_mutex mutex;
 	janus_refcount ref;
+	gboolean o2m_racable;
+	GList* o2m_usernames;
 } janus_videocall_session;
 static GHashTable *sessions = NULL, *usernames = NULL;
 static janus_mutex sessions_mutex = JANUS_MUTEX_INITIALIZER;
@@ -420,6 +425,19 @@ static void janus_videocall_session_free(const janus_refcount *session_ref) {
 	/* This session can be destroyed, free all the resources */
 	g_free(session->username);
 	g_free(session);
+
+	{
+		if(session->o2m_usernames) {
+			while(session->o2m_usernames) {
+				GList *temp = g_list_first(session->o2m_usernames);
+				session->o2m_usernames = g_list_remove_link(session->o2m_usernames, temp);
+				char *username = (char *)temp->data;
+				g_list_free(temp);
+				g_free(username);
+			}
+		}
+		session->o2m_usernames = NULL;
+	}
 }
 
 static void janus_videocall_message_free(janus_videocall_message *msg) {
@@ -636,6 +654,8 @@ void janus_videocall_create_session(janus_plugin_session *handle, int *error) {
 	session->peer_bitrate = 0;
 	session->peer = NULL;
 	session->username = NULL;
+	session->o2m_racable = FALSE;
+	session->o2m_usernames = NULL;
 	janus_rtp_switching_context_reset(&session->context);
 	janus_rtp_simulcasting_context_reset(&session->sim_context);
 	janus_vp8_simulcast_context_reset(&session->vp8_context);
@@ -1024,12 +1044,36 @@ void janus_videocall_hangup_media(janus_plugin_session *handle) {
 	janus_videocall_hangup_media_internal(handle);
 	janus_mutex_unlock(&sessions_mutex);
 }
+static gboolean janus_active_call_timeout_handle(gpointer user_data) {
+	janus_videocall_session *session = (janus_videocall_session*)user_data;
+	if(session->ringing_source) {
+		g_source_destroy(session->ringing_source);
+		g_source_unref(session->ringing_source);
+		session->ringing_source = NULL;
+	}
+	if (!session->answered) {
+		gateway->close_pc(session->handle);
+	}
+}
 
 static gboolean janus_ringing_timeout_handle(gpointer user_data) {
 	janus_videocall_session *session = (janus_videocall_session*)user_data;
+		JANUS_LOG(LOG_ERR, "TIMEOUT RINGING SOURCE username %s\n",session->username);
+
 	if (!g_atomic_int_get(&session->answered)) {
 		JANUS_LOG(LOG_ERR, "hanup the media\n");
-		janus_videocall_hangup_media(session->handle);
+		 json_t *call = json_object();
+		 json_object_set_new(call, "videocall", json_string("event"));
+		 json_t *calling = json_object();
+		 json_object_set_new(calling, "event", json_string("stopringing"));
+		 json_object_set_new(calling, "username", json_string(session->username));
+		 json_object_set_new(call, "result", calling);
+		 int ret = gateway->push_event(session->handle, &janus_videocall_plugin, NULL, call, NULL);
+		 JANUS_LOG(LOG_VERB, "  >> Pushing event to peer: %d (%s)\n", ret, janus_get_api_error(ret));
+		 session->peer = NULL;
+		 g_atomic_int_set(&session->incall, 0);
+		 json_decref(call);
+		 janus_videocall_hangup_media(session);
 	}
 	if(session->ringing_source) {
 		g_source_destroy(session->ringing_source);
@@ -1108,6 +1152,442 @@ static void janus_videocall_hangup_media_internal(janus_plugin_session *handle) 
 	janus_rtp_switching_context_reset(&session->context);
 	g_atomic_int_set(&session->hangingup, 0);
 	g_atomic_int_set(&session->answered, 0);
+}
+
+gboolean janus_videocall_process_call_message(gchar *username, janus_videocall_message *msg, const char *msg_sdp_type, const char *msg_sdp, janus_videocall_session *session) {
+	int error_code = 0;
+	json_t *result = NULL;
+	char error_cause[512];
+	if(!strcmp(username, session->username)) {
+		g_atomic_int_set(&session->incall, 0);
+		JANUS_LOG(LOG_ERR, "You can't call yourself... use the EchoTest for that\n");
+		error_code = JANUS_VIDEOCALL_ERROR_USE_ECHO_TEST;
+		g_snprintf(error_cause, 512, "You can't call yourself... use the EchoTest for that");
+		/* Hangup the call attempt of the user */
+		gateway->close_pc(session->handle);
+		return FALSE;
+	}
+	janus_mutex_lock(&sessions_mutex);
+	janus_videocall_session *peer = g_hash_table_lookup(usernames, username);
+	if(peer == NULL || g_atomic_int_get(&peer->destroyed)) {
+		g_atomic_int_set(&session->incall, 0);
+		janus_mutex_unlock(&sessions_mutex);
+		JANUS_LOG(LOG_ERR, "Username '%s' doesn't exist\n", username);
+		error_code = JANUS_VIDEOCALL_ERROR_NO_SUCH_USERNAME;
+		g_snprintf(error_cause, 512, "Username '%s' doesn't exist", username);
+		/* Hangup the call attempt of the user */
+		gateway->close_pc(session->handle);
+		return FALSE;
+	}
+	/* If the call attempt proceeds we keep the references */
+	janus_refcount_increase(&session->ref);
+	janus_refcount_increase(&peer->ref);
+	if(g_atomic_int_get(&peer->incall) || peer->peer != NULL) {
+		if(g_atomic_int_compare_and_exchange(&session->incall, 1, 0) && peer) {
+			janus_refcount_decrease(&session->ref);
+			janus_refcount_decrease(&peer->ref);
+		}
+		janus_mutex_unlock(&sessions_mutex);
+		JANUS_LOG(LOG_VERB, "%s is busy\n", username);
+		/* Send SDP to our peer */
+		json_t *call = json_object();
+		json_object_set_new(call, "videocall", json_string("event"));
+		json_t *calling = json_object();
+		json_object_set_new(calling, "event", json_string("missingcall"));
+		json_object_set_new(calling, "username", json_string(session->username));
+		json_object_set_new(call, "result", calling);
+		int ret = gateway->push_event(peer->handle, &janus_videocall_plugin, NULL, call, NULL);
+		JANUS_LOG(LOG_VERB, "  >> Pushing event to peer: %d (%s)\n", ret, janus_get_api_error(ret));
+		json_decref(call);
+
+		result = json_object();
+		json_object_set_new(result, "event", json_string("hangup"));
+		json_object_set_new(result, "username", json_string(session->username));
+		json_object_set_new(result, "reason", json_string("User busy"));
+		/* Also notify event handlers */
+		if(notify_events && gateway->events_is_enabled()) {
+			json_t *info = json_object();
+			json_object_set_new(info, "event", json_string("hangup"));
+			json_object_set_new(info, "reason", json_string("User busy"));
+			gateway->notify_event(&janus_videocall_plugin, session->handle, info);
+		}
+		/* Hangup the call attempt of the user */
+		gateway->close_pc(session->handle);
+	} else {
+		/* Any SDP to handle? if not, something's wrong */
+		if(!msg_sdp) {
+			if(g_atomic_int_compare_and_exchange(&session->incall, 1, 0) && peer) {
+				janus_refcount_decrease(&session->ref);
+				janus_refcount_decrease(&peer->ref);
+			}
+			janus_mutex_unlock(&sessions_mutex);
+			JANUS_LOG(LOG_ERR, "Missing SDP\n");
+			error_code = JANUS_VIDEOCALL_ERROR_MISSING_SDP;
+			g_snprintf(error_cause, 512, "Missing SDP");
+			return FALSE;
+		}
+		char error_str[512];
+		janus_sdp *offer = janus_sdp_parse(msg_sdp, error_str, sizeof(error_str));
+		if(offer == NULL) {
+			if(g_atomic_int_compare_and_exchange(&session->incall, 1, 0) && peer) {
+				janus_refcount_decrease(&session->ref);
+				janus_refcount_decrease(&peer->ref);
+			}
+			janus_mutex_unlock(&sessions_mutex);
+			JANUS_LOG(LOG_ERR, "Error parsing offer: %s\n", error_str);
+			error_code = JANUS_VIDEOCALL_ERROR_INVALID_SDP;
+			g_snprintf(error_cause, 512, "Error parsing offer: %s", error_str);
+			return FALSE;
+		}
+		janus_sdp_destroy(offer);
+		g_atomic_int_set(&peer->incall, 1);
+		janus_refcount_increase(&session->ref);
+		janus_refcount_increase(&peer->ref);
+		janus_mutex_lock(&session->mutex);
+		session->peer = peer;
+		janus_mutex_unlock(&session->mutex);
+		janus_mutex_lock(&peer->mutex);
+		peer->peer = session;
+		janus_mutex_unlock(&peer->mutex);
+		session->has_audio = (strstr(msg_sdp, "m=audio") != NULL);
+		session->has_video = (strstr(msg_sdp, "m=video") != NULL);
+		session->has_data = (strstr(msg_sdp, "DTLS/SCTP") != NULL);
+		janus_mutex_unlock(&sessions_mutex);
+		JANUS_LOG(LOG_VERB, "%s is calling %s\n", session->username, peer->username);
+		JANUS_LOG(LOG_VERB, "This is involving a negotiation (%s) as well:\n%s\n", msg_sdp_type, msg_sdp);
+		/* Check if this user will simulcast */
+		json_t *msg_simulcast = json_object_get(msg->jsep, "simulcast");
+		if(msg_simulcast) {
+			JANUS_LOG(LOG_VERB, "VideoCall caller (%s) is going to do simulcasting\n", session->username);
+			int rid_ext_id = -1, framemarking_ext_id = -1;
+			janus_rtp_simulcasting_prepare(msg_simulcast, &rid_ext_id, &framemarking_ext_id, session->ssrc, session->rid);
+			session->sim_context.rid_ext_id = rid_ext_id;
+			session->sim_context.framemarking_ext_id = framemarking_ext_id;
+		}
+		/* Send SDP to our peer */
+		json_t *call = json_object();
+		json_object_set_new(call, "videocall", json_string("event"));
+		json_t *calling = json_object();
+		json_object_set_new(calling, "event", json_string("incomingcall"));
+		json_object_set_new(calling, "username", json_string(session->username));
+		json_object_set_new(call, "result", calling);
+		json_t *jsep = json_pack("{ssss}", "type", msg_sdp_type, "sdp", msg_sdp);
+		if(session->e2ee)
+			json_object_set_new(jsep, "e2ee", json_true());
+		g_atomic_int_set(&session->hangingup, 0);
+		g_atomic_int_set(&session->answered, 0);
+		int ret = gateway->push_event(peer->handle, &janus_videocall_plugin, NULL, call, jsep);
+		JANUS_LOG(LOG_VERB, "  >> Pushing event to peer: %d (%s)\n", ret, janus_get_api_error(ret));
+		json_decref(call);
+		json_decref(jsep);
+		/* Send an ack back */
+		result = json_object();
+		json_object_set_new(result, "event", json_string("calling"));
+		/* Also notify event handlers */
+		if(notify_events && gateway->events_is_enabled()) {
+			json_t *info = json_object();
+			json_object_set_new(info, "event", json_string("calling"));
+			gateway->notify_event(&janus_videocall_plugin, session->handle, info);
+		}
+
+		if (session->peer->ringing_source) {
+			g_source_destroy(session->peer->ringing_source);
+			g_source_unref(session->peer->ringing_source);
+			session->peer->ringing_source = NULL;
+		}
+		JANUS_LOG(LOG_ERR, "ADD RINGING SOURCE username %s\n",session->peer->username);
+
+		session->peer->ringing_source = g_timeout_source_new_seconds(ringing_duration);
+		g_source_set_callback(session->peer->ringing_source, janus_ringing_timeout_handle, session->peer, NULL);
+		g_source_set_priority(session->peer->ringing_source, G_PRIORITY_DEFAULT);
+		g_source_attach(session->peer->ringing_source, videocall_watchdog_context);
+		
+	}
+	return TRUE;
+}
+
+gboolean janus_videocall_process_call_onetomany_message(gchar *username, janus_videocall_message *msg, const char *msg_sdp_type, const char *msg_sdp, janus_videocall_session *session) {
+	int error_code = 0;
+	json_t *result = NULL;
+	char error_cause[512];
+	JANUS_LOG(LOG_ERR, "janus_videocall_process_call_onetomany_message username %s\n", username);
+	if(!strcmp(username, session->username)) {
+		g_atomic_int_set(&session->incall, 0);
+		JANUS_LOG(LOG_ERR, "You can't call yourself... use the EchoTest for that\n");
+		error_code = JANUS_VIDEOCALL_ERROR_USE_ECHO_TEST;
+		g_snprintf(error_cause, 512, "You can't call yourself... use the EchoTest for that");
+		goto error;
+	}
+	janus_mutex_lock(&sessions_mutex);
+	janus_videocall_session *peer = g_hash_table_lookup(usernames, username);
+	if(peer == NULL || g_atomic_int_get(&peer->destroyed)) {
+		g_atomic_int_set(&session->incall, 0);
+		janus_mutex_unlock(&sessions_mutex);
+		JANUS_LOG(LOG_ERR, "Username '%s' doesn't exist\n", username);
+		error_code = JANUS_VIDEOCALL_ERROR_NO_SUCH_USERNAME;
+		g_snprintf(error_cause, 512, "Username '%s' doesn't exist", username);
+		goto error;
+	}
+	/* If the call attempt proceeds we keep the references */
+	janus_refcount_increase(&session->ref);
+	janus_refcount_increase(&peer->ref);
+	if(g_atomic_int_get(&peer->incall) || peer->peer != NULL) {
+		if(g_atomic_int_compare_and_exchange(&session->incall, 1, 0) && peer) {
+			janus_refcount_decrease(&session->ref);
+			janus_refcount_decrease(&peer->ref);
+		}
+		janus_mutex_unlock(&sessions_mutex);
+		JANUS_LOG(LOG_VERB, "%s is busy\n", username);
+		/* Send SDP to our peer */
+		json_t *call = json_object();
+		json_object_set_new(call, "videocall", json_string("event"));
+		json_t *calling = json_object();
+		json_object_set_new(calling, "event", json_string("missingcall"));
+		json_object_set_new(calling, "username", json_string(session->username));
+		json_object_set_new(call, "result", calling);
+		int ret = gateway->push_event(peer->handle, &janus_videocall_plugin, NULL, call, NULL);
+		JANUS_LOG(LOG_VERB, "  >> Pushing event to peer: %d (%s)\n", ret, janus_get_api_error(ret));
+		json_decref(call);
+
+		result = json_object();
+		json_object_set_new(result, "event", json_string("hangup"));
+		json_object_set_new(result, "username", json_string(session->username));
+		json_object_set_new(result, "reason", json_string("User busy"));
+		/* Also notify event handlers */
+		if(notify_events && gateway->events_is_enabled()) {
+			json_t *info = json_object();
+			json_object_set_new(info, "event", json_string("hangup"));
+			json_object_set_new(info, "reason", json_string("User busy"));
+			gateway->notify_event(&janus_videocall_plugin, session->handle, info);
+		}
+		goto error;
+	} else {
+		/* Any SDP to handle? if not, something's wrong */
+		if(!msg_sdp) {
+			if(g_atomic_int_compare_and_exchange(&session->incall, 1, 0) && peer) {
+				janus_refcount_decrease(&session->ref);
+				janus_refcount_decrease(&peer->ref);
+			}
+			janus_mutex_unlock(&sessions_mutex);
+			JANUS_LOG(LOG_ERR, "Missing SDP\n");
+			error_code = JANUS_VIDEOCALL_ERROR_MISSING_SDP;
+			g_snprintf(error_cause, 512, "Missing SDP");
+			goto error;
+		}
+		char error_str[512];
+		janus_sdp *offer = janus_sdp_parse(msg_sdp, error_str, sizeof(error_str));
+		if(offer == NULL) {
+			if(g_atomic_int_compare_and_exchange(&session->incall, 1, 0) && peer) {
+				janus_refcount_decrease(&session->ref);
+				janus_refcount_decrease(&peer->ref);
+			}
+			janus_mutex_unlock(&sessions_mutex);
+			JANUS_LOG(LOG_ERR, "Error parsing offer: %s\n", error_str);
+			error_code = JANUS_VIDEOCALL_ERROR_INVALID_SDP;
+			g_snprintf(error_cause, 512, "Error parsing offer: %s", error_str);
+			goto error;
+		}
+		janus_sdp_destroy(offer);
+		g_atomic_int_set(&peer->incall, 1);
+		janus_refcount_increase(&session->ref);
+		janus_refcount_increase(&peer->ref);
+		janus_mutex_lock(&session->mutex);
+		session->peer = peer;
+		janus_mutex_unlock(&session->mutex);
+		janus_mutex_lock(&peer->mutex);
+		peer->peer = session;
+		janus_mutex_unlock(&peer->mutex);
+		session->has_audio = (strstr(msg_sdp, "m=audio") != NULL);
+		session->has_video = (strstr(msg_sdp, "m=video") != NULL);
+		session->has_data = (strstr(msg_sdp, "DTLS/SCTP") != NULL);
+		janus_mutex_unlock(&sessions_mutex);
+		JANUS_LOG(LOG_VERB, "%s is calling %s\n", session->username, peer->username);
+		JANUS_LOG(LOG_VERB, "This is involving a negotiation (%s) as well:\n%s\n", msg_sdp_type, msg_sdp);
+		/* Check if this user will simulcast */
+		json_t *msg_simulcast = json_object_get(msg->jsep, "simulcast");
+		if(msg_simulcast) {
+			JANUS_LOG(LOG_VERB, "VideoCall caller (%s) is going to do simulcasting\n", session->username);
+			int rid_ext_id = -1, framemarking_ext_id = -1;
+			janus_rtp_simulcasting_prepare(msg_simulcast, &rid_ext_id, &framemarking_ext_id, session->ssrc, session->rid);
+			session->sim_context.rid_ext_id = rid_ext_id;
+			session->sim_context.framemarking_ext_id = framemarking_ext_id;
+		}
+		/* Send SDP to our peer */
+		json_t *call = json_object();
+		json_object_set_new(call, "videocall", json_string("event"));
+		json_t *calling = json_object();
+		json_object_set_new(calling, "event", json_string("incomingcall"));
+		json_object_set_new(calling, "username", json_string(session->username));
+		json_object_set_new(call, "result", calling);
+		json_t *jsep = json_pack("{ssss}", "type", msg_sdp_type, "sdp", msg_sdp);
+		if(session->e2ee)
+			json_object_set_new(jsep, "e2ee", json_true());
+		g_atomic_int_set(&session->hangingup, 0);
+		g_atomic_int_set(&session->answered, 0);
+		int ret = gateway->push_event(peer->handle, &janus_videocall_plugin, NULL, call, jsep);
+		JANUS_LOG(LOG_VERB, "  >> Pushing event to peer: %d (%s)\n", ret, janus_get_api_error(ret));
+		json_decref(call);
+		json_decref(jsep);
+		/* Send an ack back */
+		result = json_object();
+		json_object_set_new(result, "event", json_string("calling"));
+		/* Also notify event handlers */
+		if(notify_events && gateway->events_is_enabled()) {
+			json_t *info = json_object();
+			json_object_set_new(info, "event", json_string("calling"));
+			gateway->notify_event(&janus_videocall_plugin, session->handle, info);
+		}
+
+		if (session->peer->ringing_source) {
+			g_source_destroy(session->peer->ringing_source);
+			g_source_unref(session->peer->ringing_source);
+			session->peer->ringing_source = NULL;
+		}
+		JANUS_LOG(LOG_ERR, "ADD RINGING SOURCE username %s\n",session->peer->username);
+
+		session->peer->ringing_source = g_timeout_source_new_seconds(ringing_duration);
+		g_source_set_callback(session->peer->ringing_source, janus_ringing_timeout_handle, session->peer, NULL);
+		g_source_set_priority(session->peer->ringing_source, G_PRIORITY_DEFAULT);
+		g_source_attach(session->peer->ringing_source, videocall_watchdog_context);
+		
+	}
+		
+	return TRUE;
+	error:
+		// {
+		// 	/* Prepare JSON error event */
+		// 	json_t *event = json_object();
+		// 	json_object_set_new(event, "videocall", json_string("event"));
+		// 	json_object_set_new(event, "error_code", json_integer(error_code));
+		// 	json_object_set_new(event, "error", json_string(error_cause));
+		// 	int ret = gateway->push_event(msg->handle, &janus_videocall_plugin, msg->transaction, event, NULL);
+		// 	JANUS_LOG(LOG_VERB, "  >> Pushing event: %d (%s)\n", ret, janus_get_api_error(ret));
+		// 	json_decref(event);
+		// }
+	return FALSE;
+}
+
+gboolean janus_videocall_process_accept_message(janus_videocall_message *msg, const char *msg_sdp_type, const char *msg_sdp, janus_videocall_session *peer) {
+	int error_code = 0;
+	json_t *result = NULL;
+	char error_cause[512];
+	janus_videocall_session *session = peer->peer;
+	janus_refcount_increase(&peer->ref);
+	/* Any SDP to handle? if not, something's wrong */
+	if(!msg_sdp) {
+		janus_refcount_decrease(&peer->ref);
+		JANUS_LOG(LOG_ERR, "Missing SDP\n");
+		error_code = JANUS_VIDEOCALL_ERROR_MISSING_SDP;
+		g_snprintf(error_cause, 512, "Missing SDP");
+		return FALSE;
+	}
+	char error_str[512];
+	janus_sdp *answer = janus_sdp_parse(msg_sdp, error_str, sizeof(error_str));
+	if(answer == NULL) {
+		janus_refcount_decrease(&peer->ref);
+		JANUS_LOG(LOG_ERR, "Error parsing answer: %s\n", error_str);
+		error_code = JANUS_VIDEOCALL_ERROR_INVALID_SDP;
+		g_snprintf(error_cause, 512, "Error parsing answer: %s", error_str);
+		return FALSE;
+	}
+	JANUS_LOG(LOG_VERB, "%s is accepting a call from %s\n", session->username, peer->username);
+	JANUS_LOG(LOG_VERB, "This is involving a negotiation (%s) as well:\n%s\n", msg_sdp_type, msg_sdp);
+	session->has_audio = (strstr(msg_sdp, "m=audio") != NULL);
+	session->has_video = (strstr(msg_sdp, "m=video") != NULL);
+	session->has_data = (strstr(msg_sdp, "DTLS/SCTP") != NULL);
+	/* Check if this user will simulcast */
+	json_t *msg_simulcast = json_object_get(msg->jsep, "simulcast");
+	if(msg_simulcast && janus_get_codec_pt(msg_sdp, "vp8") > 0) {
+		JANUS_LOG(LOG_VERB, "VideoCall callee (%s) is going to do simulcasting\n", session->username);
+		session->ssrc[0] = json_integer_value(json_object_get(msg_simulcast, "ssrc-0"));
+		session->ssrc[1] = json_integer_value(json_object_get(msg_simulcast, "ssrc-1"));
+		session->ssrc[2] = json_integer_value(json_object_get(msg_simulcast, "ssrc-2"));
+	} else {
+		int i=0;
+		for(i=0; i<3; i++) {
+			session->ssrc[i] = 0;
+			g_free(session->rid[0]);
+			session->rid[0] = NULL;
+			if(peer) {
+				peer->ssrc[i] = 0;
+				g_free(peer->rid[0]);
+				peer->rid[0] = NULL;
+			}
+		}
+	}
+	/* Check which codecs we ended up using */
+	const char *acodec = NULL, *vcodec = NULL;
+	janus_sdp_find_first_codecs(answer, &acodec, &vcodec);
+	session->acodec = janus_audiocodec_from_name(acodec);
+	session->vcodec = janus_videocodec_from_name(vcodec);
+	if(session->acodec == JANUS_AUDIOCODEC_NONE) {
+		session->has_audio = FALSE;
+		if(peer)
+			peer->has_audio = FALSE;
+	} else if(peer) {
+		peer->acodec = session->acodec;
+	}
+	if(session->vcodec == JANUS_VIDEOCODEC_NONE) {
+		session->has_video = FALSE;
+		if(peer)
+			peer->has_video = FALSE;
+	} else if(peer) {
+		peer->vcodec = session->vcodec;
+	}
+	janus_sdp_destroy(answer);
+	/* Send SDP to our peer */
+	json_t *jsep = json_pack("{ssss}", "type", msg_sdp_type, "sdp", msg_sdp);
+	if(session->e2ee)
+		json_object_set_new(jsep, "e2ee", json_true());
+	json_t *call = json_object();
+	json_object_set_new(call, "videocall", json_string("event"));
+	json_t *calling = json_object();
+	json_object_set_new(calling, "event", json_string("accepted"));
+	json_object_set_new(calling, "username", json_string(session->username));
+	json_object_set_new(call, "result", calling);
+	g_atomic_int_set(&session->hangingup, 0);
+	g_atomic_int_set(&session->answered, 1);
+	g_atomic_int_set(&session->peer->answered, 1);
+	if (session->ringing_source) {
+		JANUS_LOG(LOG_ERR,"DEL RINGING SOURCE usernmae %s\n", session->username);
+		g_source_destroy(session->ringing_source);
+		g_source_unref(session->ringing_source);
+		session->ringing_source = NULL;
+	}
+	JANUS_LOG(LOG_ERR, "ACCEPTED username %s\n", peer->username);
+	int ret = gateway->push_event(peer->handle, &janus_videocall_plugin, NULL, call, jsep);
+	JANUS_LOG(LOG_VERB, "  >> Pushing event to peer: %d (%s)\n", ret, janus_get_api_error(ret));
+	json_decref(call);
+	json_decref(jsep);
+	/* Send an ack back */
+	result = json_object();
+	json_object_set_new(result, "event", json_string("accepted"));
+	/* Also notify event handlers */
+	if(notify_events && gateway->events_is_enabled()) {
+		json_t *info = json_object();
+		json_object_set_new(info, "event", json_string("accepted"));
+		gateway->notify_event(&janus_videocall_plugin, session->handle, info);
+	}
+	/* Is simulcasting involved on either side? */
+	if(session->ssrc[0] || session->rid[0]) {
+		peer->sim_context.substream_target = 2;	/* Let's aim for the highest quality */
+		peer->sim_context.templayer_target = 2;	/* Let's aim for all temporal layers */
+	}
+	if(peer->ssrc[0] || peer->rid[0]) {
+		session->sim_context.substream_target = 2;	/* Let's aim for the highest quality */
+		session->sim_context.templayer_target = 2;	/* Let's aim for all temporal layers */
+	}
+	/* We don't need this reference anymore, it was already increased by the peer calling us */
+	janus_refcount_decrease(&peer->ref);
+	return TRUE;
+}
+
+gboolean janus_videocall_process_accept_one2many_message(janus_videocall_message *msg, const char *msg_sdp, janus_videocall_session *peer) {
+	return TRUE;
+}
+
+gboolean janus_videocall_process_accept_one2many_with_accept_race_message(janus_videocall_message *msg, const char *msg_sdp_type, const char *msg_sdp, janus_videocall_session *peer) {
+	return janus_videocall_process_accept_message(msg, msg_sdp_type, msg_sdp, peer);
 }
 
 /* Thread to handle incoming messages */
@@ -1253,269 +1733,139 @@ static void *janus_videocall_handler(void *data) {
 				gateway->close_pc(session->handle);
 				goto error;
 			}
-			JANUS_VALIDATE_JSON_OBJECT(root, username_parameters,
-				error_code, error_cause, TRUE,
-				JANUS_VIDEOCALL_ERROR_MISSING_ELEMENT, JANUS_VIDEOCALL_ERROR_INVALID_ELEMENT);
-			if(error_code != 0) {
-				/* Hangup the call attempt of the user */
-				g_atomic_int_set(&session->incall, 0);
-				gateway->close_pc(session->handle);
-				goto error;
-			}
+			// JANUS_VALIDATE_JSON_OBJECT(root, username_parameters,
+			// 	error_code, error_cause, TRUE,
+			// 	JANUS_VIDEOCALL_ERROR_MISSING_ELEMENT, JANUS_VIDEOCALL_ERROR_INVALID_ELEMENT);
+			// if(error_code != 0) {
+			// 	/* Hangup the call attempt of the user */
+			// 	g_atomic_int_set(&session->incall, 0);
+			// 	gateway->close_pc(session->handle);
+			// 	goto error;
+			// }
 			json_t *username = json_object_get(root, "username");
-			const char *username_text = json_string_value(username);
-			if(!strcmp(username_text, session->username)) {
-				g_atomic_int_set(&session->incall, 0);
-				JANUS_LOG(LOG_ERR, "You can't call yourself... use the EchoTest for that\n");
-				error_code = JANUS_VIDEOCALL_ERROR_USE_ECHO_TEST;
-				g_snprintf(error_cause, 512, "You can't call yourself... use the EchoTest for that");
-				/* Hangup the call attempt of the user */
-				gateway->close_pc(session->handle);
-				goto error;
-			}
-			janus_mutex_lock(&sessions_mutex);
-			janus_videocall_session *peer = g_hash_table_lookup(usernames, username_text);
-			if(peer == NULL || g_atomic_int_get(&peer->destroyed)) {
-				g_atomic_int_set(&session->incall, 0);
-				janus_mutex_unlock(&sessions_mutex);
-				JANUS_LOG(LOG_ERR, "Username '%s' doesn't exist\n", username_text);
-				error_code = JANUS_VIDEOCALL_ERROR_NO_SUCH_USERNAME;
-				g_snprintf(error_cause, 512, "Username '%s' doesn't exist", username_text);
-				/* Hangup the call attempt of the user */
-				gateway->close_pc(session->handle);
-				goto error;
-			}
-			/* If the call attempt proceeds we keep the references */
-			janus_refcount_increase(&session->ref);
-			janus_refcount_increase(&peer->ref);
-			if(g_atomic_int_get(&peer->incall) || peer->peer != NULL) {
-				if(g_atomic_int_compare_and_exchange(&session->incall, 1, 0) && peer) {
-					janus_refcount_decrease(&session->ref);
-					janus_refcount_decrease(&peer->ref);
-				}
-				janus_mutex_unlock(&sessions_mutex);
-				JANUS_LOG(LOG_VERB, "%s is busy\n", username_text);
-				/* Send SDP to our peer */
-				json_t *call = json_object();
-				json_object_set_new(call, "videocall", json_string("event"));
-				json_t *calling = json_object();
-				json_object_set_new(calling, "event", json_string("missingcall"));
-				json_object_set_new(calling, "username", json_string(session->username));
-				json_object_set_new(call, "result", calling);
-				int ret = gateway->push_event(peer->handle, &janus_videocall_plugin, NULL, call, NULL);
-				JANUS_LOG(LOG_VERB, "  >> Pushing event to peer: %d (%s)\n", ret, janus_get_api_error(ret));
-				json_decref(call);
-
-				result = json_object();
-				json_object_set_new(result, "event", json_string("hangup"));
-				json_object_set_new(result, "username", json_string(session->username));
-				json_object_set_new(result, "reason", json_string("User busy"));
-				/* Also notify event handlers */
-				if(notify_events && gateway->events_is_enabled()) {
-					json_t *info = json_object();
-					json_object_set_new(info, "event", json_string("hangup"));
-					json_object_set_new(info, "reason", json_string("User busy"));
-					gateway->notify_event(&janus_videocall_plugin, session->handle, info);
-				}
-				/* Hangup the call attempt of the user */
-				gateway->close_pc(session->handle);
-			} else {
-				/* Any SDP to handle? if not, something's wrong */
-				if(!msg_sdp) {
-					if(g_atomic_int_compare_and_exchange(&session->incall, 1, 0) && peer) {
-						janus_refcount_decrease(&session->ref);
-						janus_refcount_decrease(&peer->ref);
-					}
-					janus_mutex_unlock(&sessions_mutex);
-					JANUS_LOG(LOG_ERR, "Missing SDP\n");
-					error_code = JANUS_VIDEOCALL_ERROR_MISSING_SDP;
-					g_snprintf(error_cause, 512, "Missing SDP");
+			if (json_is_string(username)) {
+				const char *username_text = json_string_value(username);
+				if (!janus_videocall_process_call_message(username_text, msg, msg_sdp_type, msg_sdp, session)) {
 					goto error;
 				}
-				char error_str[512];
-				janus_sdp *offer = janus_sdp_parse(msg_sdp, error_str, sizeof(error_str));
-				if(offer == NULL) {
-					if(g_atomic_int_compare_and_exchange(&session->incall, 1, 0) && peer) {
-						janus_refcount_decrease(&session->ref);
-						janus_refcount_decrease(&peer->ref);
-					}
-					janus_mutex_unlock(&sessions_mutex);
-					JANUS_LOG(LOG_ERR, "Error parsing offer: %s\n", error_str);
-					error_code = JANUS_VIDEOCALL_ERROR_INVALID_SDP;
-					g_snprintf(error_cause, 512, "Error parsing offer: %s", error_str);
+			} else if (json_is_array(username)) {
+				JANUS_VALIDATE_JSON_OBJECT(root, accept_race_parameters,
+					error_code, error_cause, TRUE,
+					JANUS_VIDEOCALL_ERROR_MISSING_ELEMENT, JANUS_VIDEOCALL_ERROR_INVALID_ELEMENT);
+				if(error_code != 0)
 					goto error;
-				}
-				janus_sdp_destroy(offer);
-				g_atomic_int_set(&peer->incall, 1);
-				janus_refcount_increase(&session->ref);
-				janus_refcount_increase(&peer->ref);
-				janus_mutex_lock(&session->mutex);
-				session->peer = peer;
-				janus_mutex_unlock(&session->mutex);
-				janus_mutex_lock(&peer->mutex);
-				peer->peer = session;
-				janus_mutex_unlock(&peer->mutex);
-				session->has_audio = (strstr(msg_sdp, "m=audio") != NULL);
-				session->has_video = (strstr(msg_sdp, "m=video") != NULL);
-				session->has_data = (strstr(msg_sdp, "DTLS/SCTP") != NULL);
-				janus_mutex_unlock(&sessions_mutex);
-				JANUS_LOG(LOG_VERB, "%s is calling %s\n", session->username, peer->username);
-				JANUS_LOG(LOG_VERB, "This is involving a negotiation (%s) as well:\n%s\n", msg_sdp_type, msg_sdp);
-				/* Check if this user will simulcast */
-				json_t *msg_simulcast = json_object_get(msg->jsep, "simulcast");
-				if(msg_simulcast) {
-					JANUS_LOG(LOG_VERB, "VideoCall caller (%s) is going to do simulcasting\n", session->username);
-					int rid_ext_id = -1, framemarking_ext_id = -1;
-					janus_rtp_simulcasting_prepare(msg_simulcast, &rid_ext_id, &framemarking_ext_id, session->ssrc, session->rid);
-					session->sim_context.rid_ext_id = rid_ext_id;
-					session->sim_context.framemarking_ext_id = framemarking_ext_id;
-				}
-				/* Send SDP to our peer */
-				json_t *call = json_object();
-				json_object_set_new(call, "videocall", json_string("event"));
-				json_t *calling = json_object();
-				json_object_set_new(calling, "event", json_string("incomingcall"));
-				json_object_set_new(calling, "username", json_string(session->username));
-				json_object_set_new(call, "result", calling);
-				json_t *jsep = json_pack("{ssss}", "type", msg_sdp_type, "sdp", msg_sdp);
-				if(session->e2ee)
-					json_object_set_new(jsep, "e2ee", json_true());
-				g_atomic_int_set(&session->hangingup, 0);
-				g_atomic_int_set(&session->answered, 0);
-				int ret = gateway->push_event(peer->handle, &janus_videocall_plugin, NULL, call, jsep);
-				JANUS_LOG(LOG_VERB, "  >> Pushing event to peer: %d (%s)\n", ret, janus_get_api_error(ret));
-				json_decref(call);
-				json_decref(jsep);
-				/* Send an ack back */
-				result = json_object();
-				json_object_set_new(result, "event", json_string("calling"));
-				/* Also notify event handlers */
-				if(notify_events && gateway->events_is_enabled()) {
-					json_t *info = json_object();
-					json_object_set_new(info, "event", json_string("calling"));
-					gateway->notify_event(&janus_videocall_plugin, session->handle, info);
+				json_t *racable = json_object_get(root, "accept_race");
+				if(racable) {
+					session->o2m_racable = json_is_true(racable);
+					JANUS_LOG(LOG_VERB, "Setting session the race of the accept operation: %s\n", session->o2m_racable ? "true" : "false");
 				}
 
-				if (session->peer->ringing_source) {
-					g_source_destroy(session->peer->ringing_source);
-					g_source_unref(session->peer->ringing_source);
-					session->peer->ringing_source = NULL;
+				{
+					if(session->o2m_usernames) {
+						while(session->o2m_usernames) {
+							GList *temp = g_list_first(session->o2m_usernames);
+							session->o2m_usernames = g_list_remove_link(session->o2m_usernames, temp);
+							char *username = (char *)temp->data;
+							g_list_free(temp);
+							g_free(username);
+						}
+					}
+					session->o2m_usernames = NULL;
 				}
-
-				session->peer->ringing_source = g_timeout_source_new_seconds(ringing_duration);
-				g_source_set_callback(session->peer->ringing_source, janus_ringing_timeout_handle, session->peer, NULL);
-				g_source_set_priority(session->peer->ringing_source, G_PRIORITY_DEFAULT);
-				g_source_attach(session->peer->ringing_source, videocall_watchdog_context);
+				JANUS_LOG(LOG_ERR, "CURRENT session user %s o2m_username size %d\n", session->username, g_list_length(session->o2m_usernames));
+				if(json_array_size(username) > 0) {
+					size_t i = 0;
+					for(i=0; i<json_array_size(username); i++) {
+						json_t *c = json_array_get(username, i);
+						const char *username_text = json_string_value(c);
+						if (janus_videocall_process_call_onetomany_message(username_text, msg, msg_sdp_type, msg_sdp, session)) {
+							session->o2m_usernames = g_list_append(session->o2m_usernames, (gpointer)g_strdup(username_text));
+						}
+					}
+					if ((session->o2m_usernames) && (g_list_length(session->o2m_usernames) > 0)) {
+						g_atomic_int_set(&session->incall, 1);
+					} else if (session->o2m_usernames == NULL) {
+						gateway->close_pc(session->handle);
+					}
 				
+				}
+
 			}
+
+			if (session->ringing_source) {
+				g_source_destroy(session->ringing_source);
+				g_source_unref(session->ringing_source);
+				session->ringing_source = NULL;
+			}
+			session->ringing_source = g_timeout_source_new_seconds(ringing_duration+1);
+			g_source_set_callback(session->ringing_source, janus_active_call_timeout_handle, session, NULL);
+			g_source_set_priority(session->ringing_source, G_PRIORITY_DEFAULT);
+			g_source_attach(session->ringing_source, videocall_watchdog_context);
+
 		} else if(!strcasecmp(request_text, "accept")) {
 			/* Accept a call from another peer */
 			janus_videocall_session *peer = session->peer;
 			if(peer == NULL || !g_atomic_int_get(&session->incall) || !g_atomic_int_get(&peer->incall)) {
-				JANUS_LOG(LOG_ERR, "No incoming call to accept\n");
+				JANUS_LOG(LOG_ERR, "No incoming call to accept session->incall(%s) %d peer->incall(%s) %d\n", session->username, session->incall, peer->username, peer->incall);
 				error_code = JANUS_VIDEOCALL_ERROR_NO_CALL;
 				g_snprintf(error_cause, 512, "No incoming call to accept");
 				goto error;
 			}
-			janus_refcount_increase(&peer->ref);
-			/* Any SDP to handle? if not, something's wrong */
-			if(!msg_sdp) {
-				janus_refcount_decrease(&peer->ref);
-				JANUS_LOG(LOG_ERR, "Missing SDP\n");
-				error_code = JANUS_VIDEOCALL_ERROR_MISSING_SDP;
-				g_snprintf(error_cause, 512, "Missing SDP");
-				goto error;
-			}
-			char error_str[512];
-			janus_sdp *answer = janus_sdp_parse(msg_sdp, error_str, sizeof(error_str));
-			if(answer == NULL) {
-				janus_refcount_decrease(&peer->ref);
-				JANUS_LOG(LOG_ERR, "Error parsing answer: %s\n", error_str);
-				error_code = JANUS_VIDEOCALL_ERROR_INVALID_SDP;
-				g_snprintf(error_cause, 512, "Error parsing answer: %s", error_str);
-				goto error;
-			}
-			JANUS_LOG(LOG_VERB, "%s is accepting a call from %s\n", session->username, peer->username);
-			JANUS_LOG(LOG_VERB, "This is involving a negotiation (%s) as well:\n%s\n", msg_sdp_type, msg_sdp);
-			session->has_audio = (strstr(msg_sdp, "m=audio") != NULL);
-			session->has_video = (strstr(msg_sdp, "m=video") != NULL);
-			session->has_data = (strstr(msg_sdp, "DTLS/SCTP") != NULL);
-			/* Check if this user will simulcast */
-			json_t *msg_simulcast = json_object_get(msg->jsep, "simulcast");
-			if(msg_simulcast && janus_get_codec_pt(msg_sdp, "vp8") > 0) {
-				JANUS_LOG(LOG_VERB, "VideoCall callee (%s) is going to do simulcasting\n", session->username);
-				session->ssrc[0] = json_integer_value(json_object_get(msg_simulcast, "ssrc-0"));
-				session->ssrc[1] = json_integer_value(json_object_get(msg_simulcast, "ssrc-1"));
-				session->ssrc[2] = json_integer_value(json_object_get(msg_simulcast, "ssrc-2"));
+			if (!peer->o2m_usernames) {
+				janus_videocall_process_accept_message(msg, msg_sdp_type, msg_sdp, peer);
 			} else {
-				int i=0;
-				for(i=0; i<3; i++) {
-					session->ssrc[i] = 0;
-					g_free(session->rid[0]);
-					session->rid[0] = NULL;
-					if(peer) {
-						peer->ssrc[i] = 0;
-						g_free(peer->rid[0]);
-						peer->rid[0] = NULL;
+				if (peer->o2m_racable) {
+					GList *callees = peer->o2m_usernames;
+					while (callees) {
+						const char *username = (const char *)callees->data;
+						JANUS_LOG(LOG_ERR, "ITERATOR o2m usernames %s\n", username);
+						janus_mutex_lock(&sessions_mutex);
+						janus_videocall_session *callee_video_session = g_hash_table_lookup(usernames, username);
+						janus_mutex_unlock(&sessions_mutex);
+						if(strcmp(callee_video_session->username, session->username) != 0) {
+							JANUS_LOG(LOG_ERR, "callee_video_session incall %d\n", callee_video_session->incall);
+							if (g_atomic_int_get(&callee_video_session->answered) == 0) {
+								janus_mutex_lock(&sessions_mutex);
+								janus_refcount_increase(&callee_video_session->ref);
+								json_t *call = json_object();
+								json_object_set_new(call, "videocall", json_string("event"));
+								json_t *calling = json_object();
+								json_object_set_new(calling, "event", json_string("stopringing"));
+								json_object_set_new(calling, "username", json_string(peer->username));
+								json_object_set_new(call, "result", calling);
+								JANUS_LOG(LOG_ERR, "callee_video_session username %s is incall %d\n", callee_video_session->username, callee_video_session->incall);
+								
+								int ret = gateway->push_event(callee_video_session->handle, &janus_videocall_plugin, NULL, call, NULL);
+								JANUS_LOG(LOG_VERB, "  >> Pushing event to peer: %d (%s)\n", ret, janus_get_api_error(ret));
+						
+								callee_video_session->peer = NULL;
+								g_atomic_int_set(&callee_video_session->incall, 0);
+								json_decref(call);
+								if (callee_video_session->ringing_source) {
+									g_source_destroy(callee_video_session->ringing_source);
+									g_source_unref(callee_video_session->ringing_source);
+									callee_video_session->ringing_source = NULL;
+								}
+								janus_refcount_decrease(&callee_video_session->ref);
+								janus_mutex_unlock(&sessions_mutex);
+							}
+						} else {
+							janus_mutex_lock(&session->mutex);
+							session->peer = peer;
+							janus_mutex_unlock(&session->mutex);
+							janus_mutex_lock(&peer->mutex);
+							peer->peer = session;
+							janus_mutex_unlock(&peer->mutex);
+							JANUS_LOG(LOG_ERR, "ACCEPT o2m race session %s peer %s\n", session->username, peer->username);
+							janus_videocall_process_accept_one2many_with_accept_race_message(msg, msg_sdp_type, msg_sdp, peer);
+						}
+						callees = callees->next;
 					}
+				} else {
+					janus_videocall_process_accept_one2many_message(msg, msg_sdp, peer);
 				}
 			}
-			/* Check which codecs we ended up using */
-			const char *acodec = NULL, *vcodec = NULL;
-			janus_sdp_find_first_codecs(answer, &acodec, &vcodec);
-			session->acodec = janus_audiocodec_from_name(acodec);
-			session->vcodec = janus_videocodec_from_name(vcodec);
-			if(session->acodec == JANUS_AUDIOCODEC_NONE) {
-				session->has_audio = FALSE;
-				if(peer)
-					peer->has_audio = FALSE;
-			} else if(peer) {
-				peer->acodec = session->acodec;
-			}
-			if(session->vcodec == JANUS_VIDEOCODEC_NONE) {
-				session->has_video = FALSE;
-				if(peer)
-					peer->has_video = FALSE;
-			} else if(peer) {
-				peer->vcodec = session->vcodec;
-			}
-			janus_sdp_destroy(answer);
-			/* Send SDP to our peer */
-			json_t *jsep = json_pack("{ssss}", "type", msg_sdp_type, "sdp", msg_sdp);
-			if(session->e2ee)
-				json_object_set_new(jsep, "e2ee", json_true());
-			json_t *call = json_object();
-			json_object_set_new(call, "videocall", json_string("event"));
-			json_t *calling = json_object();
-			json_object_set_new(calling, "event", json_string("accepted"));
-			json_object_set_new(calling, "username", json_string(session->username));
-			json_object_set_new(call, "result", calling);
-			g_atomic_int_set(&session->hangingup, 0);
-			g_atomic_int_set(&session->answered, 1);
-			int ret = gateway->push_event(peer->handle, &janus_videocall_plugin, NULL, call, jsep);
-			JANUS_LOG(LOG_VERB, "  >> Pushing event to peer: %d (%s)\n", ret, janus_get_api_error(ret));
-			json_decref(call);
-			json_decref(jsep);
-			/* Send an ack back */
-			result = json_object();
-			json_object_set_new(result, "event", json_string("accepted"));
-			/* Also notify event handlers */
-			if(notify_events && gateway->events_is_enabled()) {
-				json_t *info = json_object();
-				json_object_set_new(info, "event", json_string("accepted"));
-				gateway->notify_event(&janus_videocall_plugin, session->handle, info);
-			}
-			/* Is simulcasting involved on either side? */
-			if(session->ssrc[0] || session->rid[0]) {
-				peer->sim_context.substream_target = 2;	/* Let's aim for the highest quality */
-				peer->sim_context.templayer_target = 2;	/* Let's aim for all temporal layers */
-			}
-			if(peer->ssrc[0] || peer->rid[0]) {
-				session->sim_context.substream_target = 2;	/* Let's aim for the highest quality */
-				session->sim_context.templayer_target = 2;	/* Let's aim for all temporal layers */
-			}
-			/* We don't need this reference anymore, it was already increased by the peer calling us */
-			janus_refcount_decrease(&peer->ref);
+
 		} else if(!strcasecmp(request_text, "set")) {
 			/* Update the local configuration (audio/video mute/unmute, bitrate cap or recording) */
 			JANUS_VALIDATE_JSON_OBJECT(root, set_parameters,
