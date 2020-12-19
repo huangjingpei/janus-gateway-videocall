@@ -1724,13 +1724,7 @@ static void *janus_videocall_handler(void *data) {
 			}
 			json_object_set_new(result, "list", list);
 			janus_mutex_unlock(&sessions_mutex);
-		} else if(!strcasecmp(request_text, "register") || !strcasecmp(request_text, "reregister")) {
-			if (strcasecmp(request_text, "reregister") == 0) {
-				json_t *username = json_object_get(root, "username");
-				const char *username_text = json_string_value(username);
-				int res = g_hash_table_remove(usernames, (gpointer)username_text);
-				JANUS_LOG(LOG_VERB, "  -- re register remove old: %d\n", res);
-			}
+		} else if(!strcasecmp(request_text, "register")) {
 			/* Map this handle to a username */
 			if(session->username != NULL) {
 				JANUS_LOG(LOG_ERR, "Already registered (%s)\n", session->username);
@@ -1773,6 +1767,27 @@ static void *janus_videocall_handler(void *data) {
 				json_object_set_new(info, "username", json_string(username_text));
 				gateway->notify_event(&janus_videocall_plugin, session->handle, info);
 			}
+		} else if (!strcasecmp(request_text, "unregister")) {
+			int error = 0;
+			JANUS_VALIDATE_JSON_OBJECT(root, username_parameters,
+				error_code, error_cause, TRUE,
+				JANUS_VIDEOCALL_ERROR_MISSING_ELEMENT, JANUS_VIDEOCALL_ERROR_INVALID_ELEMENT);
+			if(error_code != 0)
+				goto error;
+			json_t *username = json_object_get(root, "username");
+			const char *username_text = json_string_value(username);
+			if(g_hash_table_lookup(usernames, username_text) != NULL) {
+				janus_mutex_lock(&sessions_mutex);
+				if(session->username != NULL) {
+					int res = g_hash_table_remove(usernames, (gpointer)session->username);
+					JANUS_LOG(LOG_VERB, "  -- Removed: %d\n", res);
+				}
+				janus_mutex_unlock(&sessions_mutex);
+			}
+			// result = json_object();
+			// json_object_set_new(result, "event", json_string("unregistered"));
+			// json_object_set_new(result, "username", json_string(username_text));
+			JANUS_LOG(LOG_VERB, "  -- re register remove old: %d\n", error);
 		} else if(!strcasecmp(request_text, "call")) {
 			/* Call another peer */
 			if(session->username == NULL) {
