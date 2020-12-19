@@ -1433,6 +1433,8 @@ int janus_process_incoming_request(janus_request *request) {
 				/* New session */
 				if(offer) {
 					/* Setup ICE locally (we received an offer) */
+					if(!janus_flags_is_set(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_HAS_AGENT)) {
+					
 					if(janus_ice_setup_local(handle, offer, audio, video, data, do_trickle) < 0) {
 						JANUS_LOG(LOG_ERR, "Error setting ICE locally\n");
 						janus_sdp_destroy(parsed_sdp);
@@ -1441,6 +1443,7 @@ int janus_process_incoming_request(janus_request *request) {
 						ret = janus_process_error(request, session_id, transaction_text, JANUS_ERROR_UNKNOWN, "Error setting ICE locally");
 						janus_mutex_unlock(&handle->mutex);
 						goto jsondone;
+					}
 					}
 				} else {
 					/* Make sure we're waiting for an ANSWER in the first place */
@@ -3419,10 +3422,10 @@ int janus_plugin_push_event(janus_plugin_session *plugin_session, janus_plugin *
 		if (json_is_object(result)) {
 			const char *event =  json_string_value(json_object_get(result, "event"));
 			if ((event != NULL) && (strcmp(event, "stopringing") == 0)) {
-				janus_ice_handle_destory(ice_handle, "stopringing");
+				janus_ice_handle_destory(ice_handle, "stopringing");	
 				janus_refcount_decrease(&plugin_session->ref);
 				janus_refcount_decrease(&ice_handle->ref);
-				return JANUS_OK;
+				//return JANUS_OK;
 			}
 		}
 	}
